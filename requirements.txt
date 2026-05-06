@@ -1,10 +1,8 @@
 streamlit
-numpy
+numpy==1.26.4
 pandas
 matplotlib
 scikit-learn
 librosa
-tensorflow-cpu
+tensorflow-cpu==2.15.0
 soundfile
-audioread
-numba
