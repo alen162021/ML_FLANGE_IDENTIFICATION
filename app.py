@@ -1,71 +1,86 @@
-# ============================================================
-# 1. INSTALL REQUIRED PACKAGES
-# ============================================================
-
-!apt-get install ffmpeg -y
-!pip install librosa scikit-learn tensorflow seaborn hmmlearn
-
-# ============================================================
-# 2. IMPORTS
-# ============================================================
-
-import os
-import zipfile
+import streamlit as st
 import numpy as np
+import pandas as pd
 import librosa
 import librosa.display
-import re
-import pandas as pd
-
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-from google.colab import files
+import zipfile
+import tempfile
+import os
+import re
+import soundfile as sf
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 from sklearn.preprocessing import StandardScaler
-
 from sklearn.metrics import (
     accuracy_score,
-    confusion_matrix
+    confusion_matrix,
+    classification_report
 )
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
-
-import tensorflow as tf
-from tensorflow.keras import layers, models
-
-from hmmlearn import hmm
+from sklearn.neighbors import KNeighborsClassifier
 
 # ============================================================
-# 3. UPLOAD ZIP FILE
+# PAGE CONFIG
 # ============================================================
 
-uploaded = files.upload()
+st.set_page_config(
+    page_title="Flange Looseness Detection",
+    page_icon="🔩",
+    layout="wide"
+)
 
-zip_file = list(uploaded.keys())[0]
+st.title("🔩 Flange Looseness Detection & Machine Learning")
+st.caption("""
+Upload a ZIP dataset containing percussion recordings.
 
-with zipfile.ZipFile(zip_file, "r") as zip_ref:
-    zip_ref.extractall("data")
+Training files:
+- 0ftlbF1A1.m4a
+- 25ftlbF2A3.mp4
+- 50ftlbF4A2.m4a
 
-base_path = "data"
-
-print("Folders Found:")
-print(os.listdir(base_path))
+Unknown prediction files:
+- F1A1.m4a
+- F2A2.mp4
+""")
 
 # ============================================================
-# 4. PARSE FILE NAMES
+# SIDEBAR
 # ============================================================
 
-def parse_train(filename):
+with st.sidebar:
+
+    st.header("📘 About")
+
+    st.write("""
+This application performs:
+
+- Audio signal processing
+- Feature extraction
+- Multi-class torque classification
+- Confusion matrix evaluation
+- Unknown flange prediction
+
+Supported labels:
+- 0 ft-lb
+- 25 ft-lb
+- 50 ft-lb
+""")
+
+# ============================================================
+# FILE PARSING
+# ============================================================
+
+def parse_training_filename(filename):
 
     filename = filename.replace(".mp4", "")
     filename = filename.replace(".m4a", "")
+    filename = filename.replace(".wav", "")
 
     match = re.match(
         r"(\d+)ftlbF(\d)A(\d)",
@@ -74,38 +89,50 @@ def parse_train(filename):
 
     if match:
 
-        torque = match.group(1)
-        flange = "F" + match.group(2)
-        area = "A" + match.group(3)
+        torque = int(match.group(1))
+        flange = f"F{match.group(2)}"
+        area = f"A{match.group(3)}"
 
         return torque, flange, area
 
-    return None, None, None
+    return None
 
 
-def parse_test(filename):
+def parse_unknown_filename(filename):
 
     filename = filename.replace(".mp4", "")
     filename = filename.replace(".m4a", "")
+    filename = filename.replace(".wav", "")
 
     match = re.match(r"F(\d)A(\d)", filename)
 
     if match:
 
-        flange = "F" + match.group(1)
-        area = "A" + match.group(2)
+        flange = f"F{match.group(1)}"
+        area = f"A{match.group(2)}"
 
         return flange, area
 
-    return None, None
+    return None
 
 # ============================================================
-# 5. LOAD AUDIO
+# AUDIO LOADING
 # ============================================================
 
 def load_audio(path):
 
-    signal, sr = librosa.load(path, sr=48000)
+    try:
+
+        signal, sr = librosa.load(path, sr=22050)
+
+    except:
+
+        signal, sr = sf.read(path)
+
+        if len(signal.shape) > 1:
+            signal = np.mean(signal, axis=1)
+
+    signal = signal.astype(np.float32)
 
     signal = (
         signal - np.mean(signal)
@@ -114,10 +141,14 @@ def load_audio(path):
     return signal, sr
 
 # ============================================================
-# 6. SPLIT AUDIO INTO INDIVIDUAL HITS
+# HIT SPLITTING
 # ============================================================
 
 def split_hits(signal, sr):
+
+    signal = signal / (
+        np.max(np.abs(signal)) + 1e-9
+    )
 
     energy = librosa.feature.rms(y=signal)[0]
 
@@ -138,10 +169,10 @@ def split_hits(signal, sr):
 
     hits = []
 
-    for s in segments:
+    for seg in segments:
 
-        start = s[0] * 512
-        end = min(len(signal), s[-1] * 512)
+        start = seg[0] * 512
+        end = min(len(signal), seg[-1] * 512)
 
         hit = signal[start:end]
 
@@ -151,44 +182,8 @@ def split_hits(signal, sr):
     return hits
 
 # ============================================================
-# 7. FEATURE EXTRACTION
+# FEATURE EXTRACTION
 # ============================================================
-
-def peak_to_peak(signal):
-
-    return np.max(signal) - np.min(signal)
-
-
-def crest_factor(signal):
-
-    rms = np.sqrt(np.mean(signal ** 2)) + 1e-9
-
-    return np.max(np.abs(signal)) / rms
-
-
-def fft_features(signal, sr):
-
-    fft = np.fft.rfft(signal)
-
-    mag = np.abs(fft)
-
-    freqs = np.fft.rfftfreq(
-        len(signal),
-        1 / sr
-    )
-
-    centroid = np.sum(freqs * mag) / (
-        np.sum(mag) + 1e-9
-    )
-
-    bandwidth = np.sqrt(
-        np.sum(
-            ((freqs - centroid) ** 2) * mag
-        ) / (np.sum(mag) + 1e-9)
-    )
-
-    return centroid, bandwidth
-
 
 def extract_features(signal, sr):
 
@@ -201,287 +196,79 @@ def extract_features(signal, sr):
         axis=1
     )
 
-    mel = librosa.feature.melspectrogram(
-        y=signal,
-        sr=sr,
-        n_mels=40
-    )
-
-    log_mel = librosa.power_to_db(
-        mel,
-        ref=np.max
-    )
-
-    mel_mean = np.mean(
-        log_mel,
-        axis=1
-    )
-
-    energy = np.mean(signal ** 2)
-
-    zcr = np.mean(
-        librosa.feature.zero_crossing_rate(signal)
-    )
-
-    p2p = peak_to_peak(signal)
-
-    crest = crest_factor(signal)
-
-    centroid, bandwidth = fft_features(
-        signal,
-        sr
-    )
-
-    spec_centroid = np.mean(
+    spectral_centroid = np.mean(
         librosa.feature.spectral_centroid(
             y=signal,
             sr=sr
         )
     )
 
-    spec_rolloff = np.mean(
+    spectral_rolloff = np.mean(
         librosa.feature.spectral_rolloff(
             y=signal,
             sr=sr
         )
     )
 
+    zcr = np.mean(
+        librosa.feature.zero_crossing_rate(signal)
+    )
+
+    rms = np.mean(signal ** 2)
+
+    fft = np.abs(np.fft.rfft(signal))
+    fft_mean = np.mean(fft)
+
     return np.hstack([
 
         mfcc,
 
-        mel_mean,
+        spectral_centroid,
+        spectral_rolloff,
 
-        energy,
         zcr,
-        p2p,
-        crest,
-
-        centroid,
-        bandwidth,
-
-        spec_centroid,
-        spec_rolloff
+        rms,
+        fft_mean
     ])
 
 # ============================================================
-# 8. VISUALIZATION FUNCTIONS
+# VISUALIZATION
 # ============================================================
 
 def plot_waveform(signal):
 
-    plt.figure(figsize=(12,4))
+    fig, ax = plt.subplots(figsize=(10,3))
 
-    plt.plot(signal)
+    ax.plot(signal)
 
-    plt.title("Percussion Waveform")
+    ax.set_title("Waveform")
 
-    plt.xlabel("Samples")
-
-    plt.ylabel("Amplitude")
-
-    plt.show()
+    st.pyplot(fig)
 
 
 def plot_fft(signal, sr):
 
-    fft = np.fft.rfft(signal)
+    fft = np.abs(np.fft.rfft(signal))
 
     freqs = np.fft.rfftfreq(
         len(signal),
         1/sr
     )
 
-    plt.figure(figsize=(12,4))
+    fig, ax = plt.subplots(figsize=(10,3))
 
-    plt.plot(freqs, np.abs(fft))
+    ax.plot(freqs, fft)
 
-    plt.title("FFT Spectrum")
+    ax.set_title("FFT Spectrum")
 
-    plt.xlabel("Frequency (Hz)")
+    ax.set_xlabel("Frequency (Hz)")
 
-    plt.ylabel("Magnitude")
+    st.pyplot(fig)
 
-    plt.show()
 
+def plot_confusion_matrix(cm, labels, title):
 
-def plot_mel(signal, sr):
-
-    mel = librosa.feature.melspectrogram(
-        y=signal,
-        sr=sr
-    )
-
-    mel_db = librosa.power_to_db(
-        mel,
-        ref=np.max
-    )
-
-    plt.figure(figsize=(10,4))
-
-    librosa.display.specshow(
-        mel_db,
-        sr=sr,
-        x_axis='time',
-        y_axis='mel'
-    )
-
-    plt.colorbar()
-
-    plt.title("Mel Spectrogram")
-
-    plt.show()
-
-
-def plot_mfcc(signal, sr):
-
-    mfcc = librosa.feature.mfcc(
-        y=signal,
-        sr=sr,
-        n_mfcc=13
-    )
-
-    plt.figure(figsize=(10,4))
-
-    librosa.display.specshow(
-        mfcc,
-        x_axis='time'
-    )
-
-    plt.colorbar()
-
-    plt.title("MFCC")
-
-    plt.show()
-
-# ============================================================
-# 9. LOAD DATASETS
-# ============================================================
-
-datasets = {}
-
-for folder in os.listdir(base_path):
-
-    if not folder.startswith("FLANGE_"):
-        continue
-
-    flange_id = "F" + folder.split("_")[1]
-
-    X = []
-    y = []
-
-    folder_path = os.path.join(
-        base_path,
-        folder
-    )
-
-    print("\nLoading:", folder)
-
-    for file in os.listdir(folder_path):
-
-        if not (
-            file.endswith(".mp4")
-            or file.endswith(".m4a")
-        ):
-            continue
-
-        file_path = os.path.join(
-            folder_path,
-            file
-        )
-
-        torque, fl, area = parse_train(file)
-
-        if torque is None:
-            continue
-
-        signal, sr = load_audio(file_path)
-
-        hits = split_hits(signal, sr)
-
-        for h in hits:
-
-            X.append(
-                extract_features(h, sr)
-            )
-
-            y.append(torque)
-
-    datasets[flange_id] = (
-        np.array(X),
-        np.array(y)
-    )
-
-print("\nLoaded:")
-print(datasets.keys())
-
-# ============================================================
-# 10. SIGNAL VISUALIZATION
-# ============================================================
-
-print("\n################################")
-print("SIGNAL ANALYSIS")
-print("################################")
-
-example_folder = "FLANGE_1"
-
-folder_path = os.path.join(
-    base_path,
-    example_folder
-)
-
-example_file = os.listdir(folder_path)[0]
-
-example_path = os.path.join(
-    folder_path,
-    example_file
-)
-
-signal, sr = load_audio(example_path)
-
-hits = split_hits(signal, sr)
-
-example_hit = hits[0]
-
-plot_waveform(example_hit)
-
-plot_fft(example_hit, sr)
-
-plot_mel(example_hit, sr)
-
-plot_mfcc(example_hit, sr)
-
-# ============================================================
-# 11. LABEL ENCODING
-# ============================================================
-
-le = LabelEncoder()
-
-all_labels = np.concatenate(
-    [datasets[k][1] for k in datasets]
-)
-
-le.fit(all_labels)
-
-for k in datasets:
-
-    X, y = datasets[k]
-
-    datasets[k] = (
-        X,
-        le.transform(y)
-    )
-
-print("Classes:")
-print(le.classes_)
-
-# ============================================================
-# 12. EVALUATION FUNCTIONS
-# ============================================================
-
-def plot_cm(cm, labels, title):
-
-    plt.figure(figsize=(6,5))
+    fig, ax = plt.subplots(figsize=(6,5))
 
     sns.heatmap(
         cm,
@@ -489,694 +276,358 @@ def plot_cm(cm, labels, title):
         fmt='d',
         cmap='Blues',
         xticklabels=labels,
-        yticklabels=labels
+        yticklabels=labels,
+        ax=ax
     )
 
-    plt.title(title)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title(title)
 
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-
-    plt.show()
-
-
-def evaluate_model(
-    y_true,
-    y_pred,
-    labels,
-    title
-):
-
-    cm = confusion_matrix(
-        y_true,
-        y_pred
-    )
-
-    acc = accuracy_score(
-        y_true,
-        y_pred
-    )
-
-    print("\n===================")
-    print(title)
-
-    print("Accuracy:", acc)
-
-    class_acc = {}
-
-    for i in range(len(cm)):
-
-        class_acc[labels[i]] = (
-            cm[i][i] / np.sum(cm[i])
-        )
-
-    print("Per-Class Accuracy:")
-    print(class_acc)
-
-    plot_cm(cm, labels, title)
+    st.pyplot(fig)
 
 # ============================================================
-# 13. MODEL DEFINITIONS
+# ZIP UPLOAD
 # ============================================================
 
-def train_rf(X_train, y_train):
+uploaded_zip = st.file_uploader(
+    "📦 Upload ZIP Dataset",
+    type=["zip"]
+)
 
-    model = RandomForestClassifier(
-        n_estimators=100,
-        random_state=42
+if uploaded_zip:
+
+    temp_dir = tempfile.mkdtemp()
+
+    zip_path = os.path.join(
+        temp_dir,
+        uploaded_zip.name
     )
 
-    model.fit(X_train, y_train)
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_zip.read())
 
-    return model
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(temp_dir)
 
+    # ========================================================
+    # BUILD DATASET
+    # ========================================================
 
-def train_svm(X_train, y_train):
+    X = []
+    y = []
 
-    model = SVC(kernel='rbf')
+    metadata = []
 
-    model.fit(X_train, y_train)
+    unknown_files = []
 
-    return model
-
-
-def train_dt(X_train, y_train):
-
-    model = DecisionTreeClassifier(
-        random_state=42
+    audio_extensions = (
+        ".m4a",
+        ".mp4",
+        ".wav"
     )
 
-    model.fit(X_train, y_train)
+    for root, dirs, files in os.walk(temp_dir):
 
-    return model
+        for file in files:
 
+            if not file.endswith(audio_extensions):
+                continue
 
-def train_lr(X_train, y_train):
+            full_path = os.path.join(root, file)
 
-    model = LogisticRegression(
-        max_iter=1000
+            # TRAINING FILES
+            parsed = parse_training_filename(file)
+
+            if parsed is not None:
+
+                torque, flange, area = parsed
+
+                try:
+
+                    signal, sr = load_audio(full_path)
+
+                    hits = split_hits(signal, sr)
+
+                    for h in hits:
+
+                        features = extract_features(h, sr)
+
+                        X.append(features)
+
+                        y.append(torque)
+
+                        metadata.append({
+                            "file": file,
+                            "flange": flange,
+                            "area": area,
+                            "torque": torque
+                        })
+
+                except:
+
+                    st.warning(f"Skipping corrupted file: {file}")
+
+            else:
+
+                parsed_unknown = parse_unknown_filename(file)
+
+                if parsed_unknown is not None:
+
+                    unknown_files.append({
+                        "file": file,
+                        "path": full_path,
+                        "flange": parsed_unknown[0],
+                        "area": parsed_unknown[1]
+                    })
+
+    # ========================================================
+    # CHECK DATA
+    # ========================================================
+
+    if len(X) == 0:
+
+        st.error("No valid training files found.")
+
+        st.stop()
+
+    X = np.array(X)
+    y = np.array(y)
+
+    unique_classes = np.unique(y)
+
+    if len(unique_classes) < 2:
+
+        st.error("Need at least 2 torque classes.")
+
+        st.stop()
+
+    st.success(f"Training Samples Loaded: {len(X)}")
+
+    st.write("Detected Torque Classes:")
+
+    st.write(sorted(unique_classes))
+
+    # ========================================================
+    # SIGNAL DISPLAY
+    # ========================================================
+
+    st.header("📈 Signal Analysis")
+
+    sample_signal, sample_sr = load_audio(
+        os.path.join(root, file)
     )
 
-    model.fit(X_train, y_train)
+    sample_hit = split_hits(
+        sample_signal,
+        sample_sr
+    )[0]
 
-    return model
+    col1, col2 = st.columns(2)
 
+    with col1:
+        plot_waveform(sample_hit)
 
-def train_bpnn(X_train, y_train):
+    with col2:
+        plot_fft(sample_hit, sample_sr)
 
-    model = MLPClassifier(
-        hidden_layer_sizes=(128,64),
-        max_iter=500,
-        random_state=42
+    # ========================================================
+    # SPLIT
+    # ========================================================
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.3,
+        random_state=42,
+        stratify=y
     )
-
-    model.fit(X_train, y_train)
-
-    return model
-
-
-def build_cnn(input_dim, num_classes):
-
-    model = models.Sequential([
-
-        layers.Reshape(
-            (input_dim, 1),
-            input_shape=(input_dim,)
-        ),
-
-        layers.Conv1D(
-            32,
-            3,
-            activation='relu'
-        ),
-
-        layers.MaxPooling1D(2),
-
-        layers.Conv1D(
-            64,
-            3,
-            activation='relu'
-        ),
-
-        layers.GlobalAveragePooling1D(),
-
-        layers.Dense(
-            64,
-            activation='relu'
-        ),
-
-        layers.Dense(
-            num_classes,
-            activation='softmax'
-        )
-    ])
-
-    model.compile(
-        optimizer='adam',
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-
-    return model
-
-
-def build_lstm(input_dim, num_classes):
-
-    model = models.Sequential([
-
-        layers.Reshape(
-            (input_dim, 1),
-            input_shape=(input_dim,)
-        ),
-
-        layers.LSTM(64),
-
-        layers.Dense(
-            64,
-            activation='relu'
-        ),
-
-        layers.Dense(
-            num_classes,
-            activation='softmax'
-        )
-    ])
-
-    model.compile(
-        optimizer='adam',
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-
-    return model
-
-# ============================================================
-# 14. DEPENDENT TEST
-# ============================================================
-
-print("\n################################")
-print("DEPENDENT TEST")
-print("################################")
-
-X_all = np.concatenate(
-    [datasets[k][0] for k in datasets]
-)
-
-y_all = np.concatenate(
-    [datasets[k][1] for k in datasets]
-)
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X_all,
-    y_all,
-    test_size=0.3,
-    random_state=42,
-    stratify=y_all
-)
-
-scaler = StandardScaler()
-
-X_train_scaled = scaler.fit_transform(X_train)
-
-X_test_scaled = scaler.transform(X_test)
-
-rf = train_rf(X_train_scaled, y_train)
-rf_pred = rf.predict(X_test_scaled)
-evaluate_model(y_test, rf_pred, le.classes_, "Dependent Test - RF")
-
-svm = train_svm(X_train_scaled, y_train)
-svm_pred = svm.predict(X_test_scaled)
-evaluate_model(y_test, svm_pred, le.classes_, "Dependent Test - SVM")
-
-dt = train_dt(X_train_scaled, y_train)
-dt_pred = dt.predict(X_test_scaled)
-evaluate_model(y_test, dt_pred, le.classes_, "Dependent Test - DT")
-
-lr = train_lr(X_train_scaled, y_train)
-lr_pred = lr.predict(X_test_scaled)
-evaluate_model(y_test, lr_pred, le.classes_, "Dependent Test - LR")
-
-bpnn = train_bpnn(X_train_scaled, y_train)
-bpnn_pred = bpnn.predict(X_test_scaled)
-evaluate_model(y_test, bpnn_pred, le.classes_, "Dependent Test - BPNN")
-
-cnn = build_cnn(
-    X_train_scaled.shape[1],
-    len(np.unique(y_train))
-)
-
-cnn.fit(
-    X_train_scaled,
-    y_train,
-    epochs=10,
-    verbose=0
-)
-
-cnn_pred = np.argmax(
-    cnn.predict(X_test_scaled),
-    axis=1
-)
-
-evaluate_model(
-    y_test,
-    cnn_pred,
-    le.classes_,
-    "Dependent Test - CNN"
-)
-
-lstm = build_lstm(
-    X_train_scaled.shape[1],
-    len(np.unique(y_train))
-)
-
-lstm.fit(
-    X_train_scaled,
-    y_train,
-    epochs=10,
-    verbose=0
-)
-
-lstm_pred = np.argmax(
-    lstm.predict(X_test_scaled),
-    axis=1
-)
-
-evaluate_model(
-    y_test,
-    lstm_pred,
-    le.classes_,
-    "Dependent Test - LSTM"
-)
-
-preds = np.array([
-    rf_pred,
-    svm_pred,
-    dt_pred,
-    lr_pred,
-    bpnn_pred,
-    cnn_pred,
-    lstm_pred
-])
-
-ensemble_pred = np.apply_along_axis(
-    lambda x: np.bincount(x).argmax(),
-    axis=0,
-    arr=preds
-)
-
-evaluate_model(
-    y_test,
-    ensemble_pred,
-    le.classes_,
-    "Dependent Test - FINAL ENSEMBLE"
-)
-
-# ============================================================
-# 15. BINARY FUNCTION
-# ============================================================
-
-def to_binary(y):
-
-    return np.where(
-        y == le.transform(["0"])[0],
-        0,
-        1
-    )
-
-# ============================================================
-# 16. INDEPENDENT TEST
-# ============================================================
-
-for test_key in datasets:
-
-    print("\n################################")
-    print("TEST ON:", test_key)
-    print("################################")
-
-    X_test, y_test = datasets[test_key]
-
-    X_train = []
-    y_train = []
-
-    for k in datasets:
-
-        if k != test_key:
-
-            X_train.append(datasets[k][0])
-
-            y_train.append(datasets[k][1])
-
-    X_train = np.concatenate(X_train)
-
-    y_train = np.concatenate(y_train)
 
     scaler = StandardScaler()
 
-    X_train_scaled = scaler.fit_transform(X_train)
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
 
-    X_test_scaled = scaler.transform(X_test)
+    # ========================================================
+    # MODELS
+    # ========================================================
 
-    rf = train_rf(X_train_scaled, y_train)
-    rf_pred = rf.predict(X_test_scaled)
+    models = {
 
-    svm = train_svm(X_train_scaled, y_train)
-    svm_pred = svm.predict(X_test_scaled)
+        "Random Forest":
+            RandomForestClassifier(
+                n_estimators=100,
+                random_state=42
+            ),
 
-    dt = train_dt(X_train_scaled, y_train)
-    dt_pred = dt.predict(X_test_scaled)
+        "SVM":
+            SVC(
+                probability=True
+            ),
 
-    lr = train_lr(X_train_scaled, y_train)
-    lr_pred = lr.predict(X_test_scaled)
+        "Decision Tree":
+            DecisionTreeClassifier(
+                random_state=42
+            ),
 
-    bpnn = train_bpnn(X_train_scaled, y_train)
-    bpnn_pred = bpnn.predict(X_test_scaled)
+        "Logistic Regression":
+            LogisticRegression(
+                max_iter=2000
+            ),
 
-    cnn = build_cnn(
-        X_train_scaled.shape[1],
-        len(np.unique(y_train))
-    )
+        "KNN":
+            KNeighborsClassifier()
+    }
 
-    cnn.fit(
-        X_train_scaled,
-        y_train,
-        epochs=10,
-        verbose=0
-    )
+    # ========================================================
+    # TRAINING
+    # ========================================================
 
-    cnn_pred = np.argmax(
-        cnn.predict(X_test_scaled),
-        axis=1
-    )
+    st.header("🤖 Model Evaluation")
 
-    lstm = build_lstm(
-        X_train_scaled.shape[1],
-        len(np.unique(y_train))
-    )
+    results = []
 
-    lstm.fit(
-        X_train_scaled,
-        y_train,
-        epochs=10,
-        verbose=0
-    )
+    best_model = None
+    best_acc = 0
 
-    lstm_pred = np.argmax(
-        lstm.predict(X_test_scaled),
-        axis=1
-    )
+    for name, model in models.items():
 
-    evaluate_model(
-        y_test,
-        rf_pred,
-        le.classes_,
-        f"{test_key} - RF"
-    )
+        model.fit(X_train, y_train)
 
-    evaluate_model(
-        y_test,
-        svm_pred,
-        le.classes_,
-        f"{test_key} - SVM"
-    )
+        pred = model.predict(X_test)
 
-    evaluate_model(
-        y_test,
-        dt_pred,
-        le.classes_,
-        f"{test_key} - DT"
-    )
+        acc = accuracy_score(y_test, pred)
 
-    evaluate_model(
-        y_test,
-        lr_pred,
-        le.classes_,
-        f"{test_key} - LR"
-    )
+        cm = confusion_matrix(y_test, pred)
 
-    evaluate_model(
-        y_test,
-        bpnn_pred,
-        le.classes_,
-        f"{test_key} - BPNN"
-    )
+        results.append({
+            "Model": name,
+            "Accuracy": acc
+        })
 
-    evaluate_model(
-        y_test,
-        cnn_pred,
-        le.classes_,
-        f"{test_key} - CNN"
-    )
+        if acc > best_acc:
 
-    evaluate_model(
-        y_test,
-        lstm_pred,
-        le.classes_,
-        f"{test_key} - LSTM"
-    )
+            best_acc = acc
+            best_model = model
 
-    preds = np.array([
-        rf_pred,
-        svm_pred,
-        dt_pred,
-        lr_pred,
-        bpnn_pred,
-        cnn_pred,
-        lstm_pred
-    ])
+        st.subheader(name)
 
-    ensemble_pred = np.apply_along_axis(
-        lambda x: np.bincount(x).argmax(),
-        axis=0,
-        arr=preds
-    )
+        st.write(f"Accuracy: {acc:.4f}")
 
-    evaluate_model(
-        y_test,
-        ensemble_pred,
-        le.classes_,
-        f"{test_key} - FINAL ENSEMBLE"
-    )
-
-    y_test_bin = to_binary(y_test)
-
-    ensemble_bin = to_binary(
-        ensemble_pred
-    )
-
-    evaluate_model(
-        y_test_bin,
-        ensemble_bin,
-        ["Loose", "Tight"],
-        f"{test_key} - Ensemble (2-Class)"
-    )
-
-# ============================================================
-# 17. EXPERIMENTAL TEST
-# ============================================================
-
-print("\n################################")
-print("EXPERIMENTAL TEST")
-print("################################")
-
-scaler = StandardScaler()
-
-X_all_scaled = scaler.fit_transform(X_all)
-
-final_model = train_rf(
-    X_all_scaled,
-    y_all
-)
-
-results = {}
-
-for folder in os.listdir(base_path):
-
-    if not folder.endswith("_test"):
-        continue
-
-    flange_id = "F" + folder.split("_")[1]
-
-    folder_path = os.path.join(
-        base_path,
-        folder
-    )
-
-    X_exp = []
-
-    print("\nPredicting:", flange_id)
-
-    for file in os.listdir(folder_path):
-
-        if not (
-            file.endswith(".mp4")
-            or file.endswith(".m4a")
-        ):
-            continue
-
-        file_path = os.path.join(
-            folder_path,
-            file
+        plot_confusion_matrix(
+            cm,
+            sorted(unique_classes),
+            f"{name} Confusion Matrix"
         )
 
-        signal, sr = load_audio(file_path)
-
-        hits = split_hits(signal, sr)
-
-        for h in hits:
-
-            features = extract_features(h, sr)
-
-            X_exp.append(features)
-
-    if len(X_exp) == 0:
-
-        print("No audio found.")
-
-        continue
-
-    X_exp = np.array(X_exp)
-
-    X_exp = scaler.transform(X_exp)
-
-    preds = final_model.predict(X_exp)
-
-    final = np.bincount(preds).argmax()
-
-    label = le.inverse_transform([final])[0]
-
-    results[flange_id] = label
-
-    print(f"{flange_id} → {label} ft-lbs")
-
-plt.figure(figsize=(8,5))
-
-flanges = list(results.keys())
-
-values = [
-    int(results[k])
-    for k in flanges
-]
-
-bars = plt.bar(
-    flanges,
-    values
-)
-
-plt.title(
-    "Experimental Prediction Results"
-)
-
-plt.ylabel(
-    "Predicted Torque (ft-lbs)"
-)
-
-for i, v in enumerate(values):
-
-    plt.text(
-        i,
-        v + 1,
-        str(v),
-        ha='center'
-    )
-
-plt.show()
-
-print("\n################################")
-print("FINAL SUBMISSION FORMAT")
-print("################################")
-
-print(
-    results.get("F1", "?"),
-    results.get("F2", "?"),
-    results.get("F3", "?"),
-    results.get("F4", "?")
-)
-
-# ============================================================
-# 18. OPTIONAL HMM BONUS MODEL
-# ============================================================
-
-print("\n################################")
-print("HMM BONUS MODEL")
-print("################################")
-
-def train_hmm_models(X_train, y_train):
-
-    hmm_models = {}
-
-    for label in np.unique(y_train):
-
-        class_data = X_train[
-            y_train == label
-        ]
-
-        lengths = [1] * len(class_data)
-
-        model = hmm.GaussianHMM(
-            n_components=3,
-            covariance_type='diag',
-            n_iter=100,
-            random_state=42
+        report = classification_report(
+            y_test,
+            pred,
+            output_dict=True
         )
 
-        try:
+        st.dataframe(
+            pd.DataFrame(report).transpose()
+        )
 
-            model.fit(class_data, lengths)
+    # ========================================================
+    # RESULTS TABLE
+    # ========================================================
 
-            hmm_models[label] = model
+    st.header("📊 Overall Results")
 
-        except:
+    results_df = pd.DataFrame(results)
 
-            pass
+    st.dataframe(results_df)
 
-    return hmm_models
+    best_name = results_df.sort_values(
+        "Accuracy",
+        ascending=False
+    ).iloc[0]["Model"]
 
+    st.success(
+        f"⭐ Best Model: {best_name}"
+    )
 
-def hmm_predict(hmm_models, X_test):
+    # ========================================================
+    # UNKNOWN PREDICTION
+    # ========================================================
 
-    preds = []
+    if len(unknown_files) > 0:
 
-    for x in X_test:
+        st.header("🧪 Unknown Flange Prediction")
 
-        scores = []
+        prediction_rows = []
 
-        labels = []
-
-        for label in hmm_models:
+        for item in unknown_files:
 
             try:
 
-                score = hmm_models[label].score(
-                    x.reshape(1,-1)
+                signal, sr = load_audio(item["path"])
+
+                hits = split_hits(signal, sr)
+
+                features = []
+
+                for h in hits:
+
+                    feat = extract_features(h, sr)
+
+                    features.append(feat)
+
+                if len(features) == 0:
+                    continue
+
+                features = scaler.transform(features)
+
+                preds = best_model.predict(features)
+
+                final_pred = np.bincount(preds).argmax()
+
+                confidence = np.mean(
+                    preds == final_pred
                 )
+
+                prediction_rows.append({
+
+                    "File": item["file"],
+                    "Flange": item["flange"],
+                    "Area": item["area"],
+                    "Predicted Torque":
+                        f"{final_pred} ft-lb",
+
+                    "Confidence":
+                        f"{confidence*100:.1f}%"
+                })
 
             except:
 
-                score = -999999
+                st.warning(
+                    f"Could not process {item['file']}"
+                )
 
-            scores.append(score)
+        if len(prediction_rows) > 0:
 
-            labels.append(label)
+            pred_df = pd.DataFrame(
+                prediction_rows
+            )
 
-        preds.append(
-            labels[np.argmax(scores)]
+            st.dataframe(pred_df)
+
+    # ========================================================
+    # FLANGE ANALYSIS
+    # ========================================================
+
+    st.header("🔩 Flange Distribution")
+
+    metadata_df = pd.DataFrame(metadata)
+
+    flange_counts = (
+        metadata_df.groupby(
+            ["flange", "torque"]
         )
+        .size()
+        .unstack(fill_value=0)
+    )
 
-    return np.array(preds)
-
-hmm_models = train_hmm_models(
-    X_train_scaled,
-    y_train
-)
-
-hmm_pred = hmm_predict(
-    hmm_models,
-    X_test_scaled
-)
-
-evaluate_model(
-    y_test,
-    hmm_pred,
-    le.classes_,
-    "HMM MODEL"
-)
+    st.bar_chart(flange_counts)
